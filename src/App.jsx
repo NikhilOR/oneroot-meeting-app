@@ -4,7 +4,9 @@ import { deleteMeetingFromDb, fetchMeetingsFromDb, hasSupabaseConfig, supabaseCo
 const CUSTOM_TAGS_KEY = "or_custom_tags";
 const CUSTOM_COLORS_KEY = "or_custom_tag_colors";
 const GEMINI_API_KEY_KEY = "or_gemini_api_key";
+const GEMINI_COOLDOWN_KEY = "or_gemini_cooldown_until";
 const GEMINI_MODEL = "gemini-2.5-flash";
+const GEMINI_PROXY_URL = "/api/gemini";
 
 const DEFAULT_TAGS = [
   "Vietnam",
@@ -205,6 +207,36 @@ function cleanMeetingActions(meeting) {
   return { ...meeting, actions: dedupeActions(meeting.actions || []) };
 }
 
+function waitLabel(ms) {
+  const seconds = Math.ceil(ms / 1000);
+  if (seconds <= 60) return `${seconds} seconds`;
+  const minutes = Math.ceil(seconds / 60);
+  return `${minutes} minute${minutes === 1 ? "" : "s"}`;
+}
+
+function getGeminiCooldown() {
+  const until = Number(localStorage.getItem(GEMINI_COOLDOWN_KEY) || 0);
+  return Number.isFinite(until) ? until : 0;
+}
+
+function setGeminiCooldown(ms) {
+  localStorage.setItem(GEMINI_COOLDOWN_KEY, String(Date.now() + ms));
+}
+
+function parseRetryDelay(value) {
+  if (!value) return 60_000;
+  const numeric = Number(value);
+  if (Number.isFinite(numeric)) return Math.max(1, numeric) * 1000;
+  const date = Date.parse(value);
+  return Number.isFinite(date) ? Math.max(1_000, date - Date.now()) : 60_000;
+}
+
+function extractErrorMessage(payload, fallback) {
+  if (!payload) return fallback;
+  if (typeof payload === "string") return payload;
+  return payload.error?.message || payload.message || fallback;
+}
+
 function textMentionsName(text, name) {
   if (!name) return false;
   const note = normalize(text);
@@ -303,13 +335,52 @@ function StatusPill({ status }) {
 }
 
 async function geminiMessage(prompt, maxTokens = 1200, responseMimeType = "text/plain") {
+  const cooldownUntil = getGeminiCooldown();
+  if (cooldownUntil > Date.now()) {
+    throw new Error(`Gemini quota limit reached. Try again in ${waitLabel(cooldownUntil - Date.now())}.`);
+  }
+
+  const payload = {
+    model: GEMINI_MODEL,
+    prompt,
+    maxTokens,
+    responseMimeType,
+  };
+
+  const proxied = await fetch(GEMINI_PROXY_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+  });
+
+  if (proxied.ok) {
+    const data = await proxied.json();
+    return data.text || "";
+  }
+
+  if (proxied.status !== 404) {
+    let errorPayload = null;
+    try {
+      errorPayload = await proxied.json();
+    } catch {
+      errorPayload = null;
+    }
+    if (proxied.status === 429) {
+      const retryMs = parseRetryDelay(proxied.headers.get("Retry-After") || errorPayload?.retryAfter);
+      setGeminiCooldown(retryMs);
+      throw new Error(`Gemini quota limit reached. Try again in ${waitLabel(retryMs)}.`);
+    }
+    throw new Error(extractErrorMessage(errorPayload, "AI extraction unavailable. Check Gemini server key and deployment logs."));
+  }
+
   let key = import.meta.env.VITE_GEMINI_API_KEY || localStorage.getItem(GEMINI_API_KEY_KEY) || "";
   if (!key) {
-    key = window.prompt("Enter your Gemini API key to use OneRoot Meetings AI features:") || "";
+    key = window.prompt("Enter your Gemini API key to use OneRoot Meetings AI features locally:") || "";
     if (key.trim()) localStorage.setItem(GEMINI_API_KEY_KEY, key.trim());
   }
   if (!key.trim()) throw new Error("Missing Gemini API key");
-  const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(key.trim())}`, {
+
+  const direct = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${encodeURIComponent(key.trim())}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -317,8 +388,20 @@ async function geminiMessage(prompt, maxTokens = 1200, responseMimeType = "text/
       generationConfig: { maxOutputTokens: maxTokens, temperature: 0.15, responseMimeType, thinkingConfig: { thinkingBudget: 0 } },
     }),
   });
-  if (!response.ok) throw new Error("AI request failed");
-  const data = await response.json();
+  let data = null;
+  try {
+    data = await direct.json();
+  } catch {
+    data = null;
+  }
+  if (!direct.ok) {
+    if (direct.status === 429) {
+      const retryMs = parseRetryDelay(direct.headers.get("Retry-After"));
+      setGeminiCooldown(retryMs);
+      throw new Error(`Gemini quota limit reached. Try again in ${waitLabel(retryMs)}.`);
+    }
+    throw new Error(extractErrorMessage(data, "AI request failed."));
+  }
   if (data?.candidates?.[0]?.finishReason === "MAX_TOKENS") throw new Error("AI response was cut off. Try shorter notes or run extraction again.");
   return data?.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("") || "";
 }
@@ -348,6 +431,24 @@ async function fixAndExtract(text, tags, existingActions = []) {
   const jsonText = clean.startsWith("{") ? clean : clean.slice(clean.indexOf("{"), clean.lastIndexOf("}") + 1);
   const json = JSON.parse(jsonText);
   return { corrected: json.corrected || text, actions: Array.isArray(json.actions) ? json.actions : [] };
+}
+
+function localFixAndExtract(text, tags, attendees = "", existingActions = []) {
+  const people = namesFromAttendees(attendees);
+  const actionWords = /\b(will|to|contact|meet|send|share|follow up|arrange|prepare|visit|call|check|confirm|collect|update)\b/i;
+  const lines = text.split(/\n+/).map((line) => line.trim()).filter(Boolean);
+  const actions = [];
+
+  for (const line of lines) {
+    if (!actionWords.test(line)) continue;
+    const assignee = people.find((name) => textMentionsName(line, name)) || "";
+    const normalizedLine = line.replace(/^[-*0-9.)\s]+/, "").trim();
+    if (!normalizedLine || existingActions.some((action) => isSimilarAction(action.text, normalizedLine)) || actions.some((action) => isSimilarAction(action.text, normalizedLine))) continue;
+    const category = tags.find((tag) => tag !== "General" && normalize(line).includes(normalize(tag))) || "General";
+    actions.push({ text: normalizedLine, assignee, delegate: "", category });
+  }
+
+  return { corrected: text, actions };
 }
 
 function PersonPicker({ label, value, onChange, options, exclude = [], onAdd }) {
@@ -595,10 +696,7 @@ function MeetingForm({ data, allTags, customTags, customColors, onAddTag, onDele
   const [recording, setRecording] = useState(false);
   const [interim, setInterim] = useState("");
   const speechRef = useRef(null);
-  const debounceRef = useRef(null);
-  const lastFixedRef = useRef(form.body || "");
   const actionsRef = useRef(form.actions || []);
-  const skipNextAutoRef = useRef(false);
 
   const people = [...new Set([...namesFromAttendees(form.attendees), ...manualPeople, ...(form.actions || []).flatMap((action) => [action.assignee, action.delegate]).filter(Boolean)])];
   const actionCategories = [...new Set((form.actions || []).map((action) => action.category || "General"))];
@@ -630,7 +728,7 @@ function MeetingForm({ data, allTags, customTags, customColors, onAddTag, onDele
       return;
     }
     if (manual) setBusy(true);
-    setHint(manual ? "Fixing and extracting actions..." : "Auto-checking notes and actions...");
+    setHint("Fixing and extracting actions...");
     try {
       const existingActions = actionsRef.current || [];
       const result = await fixAndExtract(sourceText, allTags, existingActions);
@@ -649,28 +747,18 @@ function MeetingForm({ data, allTags, customTags, customColors, onAddTag, onDele
         actionsRef.current = syncActionsToNotes(prev.actions || [], extracted, corrected);
         return { ...prev, body: corrected, actions: actionsRef.current };
       });
-      skipNextAutoRef.current = Boolean(result.corrected && result.corrected !== sourceText);
-      lastFixedRef.current = corrected;
       setHint(actionsRef.current.length ? `Actions synced with latest notes (${actionsRef.current.length})` : "Notes checked. No actions found.");
     } catch (error) {
-      setHint(error?.message || "AI extraction unavailable. Check API key, CORS, or network access.");
+      const fallback = localFixAndExtract(sourceText, allTags, form.attendees, actionsRef.current || []);
+      setForm((prev) => {
+        actionsRef.current = syncActionsToNotes(prev.actions || [], fallback.actions, fallback.corrected);
+        return { ...prev, actions: actionsRef.current };
+      });
+      setHint(`${error?.message || "AI extraction unavailable."} Local action extraction ran instead.`);
     } finally {
       if (manual) setBusy(false);
     }
   }
-
-  useEffect(() => {
-    clearTimeout(debounceRef.current);
-    if (skipNextAutoRef.current) {
-      skipNextAutoRef.current = false;
-      return;
-    }
-    if (!form.body.trim() || form.body === lastFixedRef.current) return;
-    debounceRef.current = setTimeout(() => {
-      processNotesWithAi();
-    }, 5000);
-    return () => clearTimeout(debounceRef.current);
-  }, [form.body, allTags]);
 
   async function extractActions() {
     await processNotesWithAi({ manual: true });
@@ -700,7 +788,6 @@ function MeetingForm({ data, allTags, customTags, customColors, onAddTag, onDele
       }
       if (finalText.trim()) {
         setForm((prev) => ({ ...prev, body: prev.body ? prev.body + "\n" + finalText.trim() : finalText.trim() }));
-        lastFixedRef.current = "";
       }
       setInterim(interimText);
     };
