@@ -248,10 +248,10 @@ function textMentionsName(text, name) {
 function mergeExtractedAction(existing, extracted, correctedNotes) {
   return {
     ...existing,
-    text: extracted.text || existing.text || "",
-    category: extracted.category || existing.category || "General",
-    assignee: extracted.assignee || (textMentionsName(correctedNotes, existing.assignee) ? existing.assignee : ""),
-    delegate: extracted.delegate || (textMentionsName(correctedNotes, existing.delegate) ? existing.delegate : ""),
+    text: existing.text || extracted.text || "",
+    category: existing.category || extracted.category || "General",
+    assignee: existing.assignee || extracted.assignee || "",
+    delegate: existing.delegate || extracted.delegate || "",
     status: existing.status || "open",
     postponeDate: existing.postponeDate || "",
     remarks: existing.remarks || "",
@@ -259,15 +259,19 @@ function mergeExtractedAction(existing, extracted, correctedNotes) {
 }
 
 function syncActionsToNotes(existingActions = [], extractedActions = [], correctedNotes = "") {
-  const synced = [];
+  const synced = existingActions.map((action) => ({ ...blankAction(), ...action }));
   for (const extracted of extractedActions) {
     const cleanText = (extracted.text || "").trim();
     if (!cleanText) continue;
     const normalizedExtracted = { ...blankAction(), ...extracted, text: cleanText };
-    const existing = existingActions.find((action) => isSimilarAction(action.text, cleanText));
-    synced.push(existing ? mergeExtractedAction(existing, normalizedExtracted, correctedNotes) : normalizedExtracted);
+    const existingIndex = synced.findIndex((action) => isSimilarAction(action.text, cleanText));
+    if (existingIndex === -1) {
+      synced.push(normalizedExtracted);
+      continue;
+    }
+    synced[existingIndex] = mergeExtractedAction(synced[existingIndex], normalizedExtracted, correctedNotes);
   }
-  return dedupeActions(synced);
+  return synced;
 }
 
 function blankAction() {
@@ -712,7 +716,7 @@ function MeetingForm({ data, allTags, customTags, customColors, onAddTag, onDele
   function updateAction(id, patch) {
     setForm((prev) => {
       const nextActions = prev.actions.map((action) => action.id === id ? { ...action, ...patch } : action);
-      actionsRef.current = dedupeActions(nextActions);
+      actionsRef.current = nextActions;
       return { ...prev, actions: actionsRef.current };
     });
   }
