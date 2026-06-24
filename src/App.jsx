@@ -16,6 +16,7 @@ import {
 
 const CUSTOM_TAGS_KEY = "or_custom_tags";
 const CUSTOM_COLORS_KEY = "or_custom_tag_colors";
+const MEETING_DRAFT_PREFIX = "or_meeting_draft";
 const GEMINI_API_KEY_KEY = "or_gemini_api_key";
 const GEMINI_COOLDOWN_KEY = "or_gemini_cooldown_until";
 const GEMINI_MODEL = "gemini-2.5-flash";
@@ -81,6 +82,17 @@ const COLOR_PALETTE = [
   ["#fff7ed", "#9a3412"],
 ];
 
+const MEETING_CARD_COLORS = [
+  { background: "#f8fbff", border: "#bfdbfe", accent: "#2563eb" },
+  { background: "#f7fdf9", border: "#bbf7d0", accent: "#16a34a" },
+  { background: "#fffaf3", border: "#fed7aa", accent: "#ea580c" },
+  { background: "#fbf8ff", border: "#ddd6fe", accent: "#7c3aed" },
+  { background: "#f7fdff", border: "#a5f3fc", accent: "#0891b2" },
+  { background: "#fff8fb", border: "#fbcfe8", accent: "#db2777" },
+  { background: "#fbfff5", border: "#d9f99d", accent: "#65a30d" },
+  { background: "#fffdf2", border: "#fde68a", accent: "#ca8a04" },
+];
+
 const STATUS_MAP = {
   open: { label: "Open", bg: "#f0fdf4", color: "#166534", border: "#bbf7d0" },
   completed: { label: "Completed", bg: "#d1fae5", color: "#065f46", border: "#6ee7b7" },
@@ -134,6 +146,60 @@ function readJson(key, fallback) {
 
 function writeJson(key, value) {
   localStorage.setItem(key, JSON.stringify(value));
+}
+
+function meetingDraftKey(userId, meetingId = "new") {
+  return `${MEETING_DRAFT_PREFIX}:${userId || "anonymous"}:${meetingId || "new"}`;
+}
+
+function readMeetingDraft(key) {
+  return readJson(key, null)?.meeting || null;
+}
+
+function hasMeetingDraftContent(meeting = {}) {
+  return Boolean(
+    (meeting.title || "").trim()
+    || (meeting.attendees || "").trim()
+    || (meeting.body || "").trim()
+    || (meeting.actions || []).some((action) => (action.text || "").trim())
+    || (meeting.tags || []).length
+  );
+}
+
+function meetingDraftPayload(meeting = {}) {
+  const { isDraft, draftKey, draftSavedAt, ...payload } = meeting;
+  return payload;
+}
+
+function writeMeetingDraft(key, meeting) {
+  const payload = meetingDraftPayload(meeting);
+  if (!hasMeetingDraftContent(payload)) {
+    clearMeetingDraft(key);
+    return;
+  }
+  writeJson(key, { meeting: payload, savedAt: new Date().toISOString() });
+}
+
+function clearMeetingDraft(key) {
+  localStorage.removeItem(key);
+}
+
+function listMeetingDrafts(userId) {
+  const prefix = `${MEETING_DRAFT_PREFIX}:${userId || "anonymous"}:`;
+  const drafts = [];
+  for (let index = 0; index < localStorage.length; index += 1) {
+    const key = localStorage.key(index);
+    if (!key?.startsWith(prefix)) continue;
+    const data = readJson(key, null);
+    if (!data?.meeting || !hasMeetingDraftContent(data.meeting)) continue;
+    drafts.push({
+      ...cleanMeetingActions(data.meeting),
+      draftKey: key,
+      draftSavedAt: data.savedAt,
+      isDraft: true,
+    });
+  }
+  return drafts.sort((a, b) => new Date(b.draftSavedAt || 0) - new Date(a.draftSavedAt || 0));
 }
 
 function namesFromAttendees(value) {
@@ -458,6 +524,21 @@ function StatusPill({ status }) {
   return <span style={{ background: st.bg, color: st.color, border: "1px solid " + st.border, borderRadius: 999, padding: "3px 9px", fontSize: 11, fontWeight: 750 }}>{st.label}</span>;
 }
 
+function AccountChip({ profile, isAdmin }) {
+  const displayName = profile?.full_name || profile?.email || "Signed in";
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 9, border: "1px solid #e5e7eb", background: "#fff", borderRadius: 999, padding: "6px 10px 6px 7px", boxShadow: "0 5px 16px rgba(20,24,20,0.05)", minHeight: 38 }}>
+      <div style={{ width: 28, height: 28, borderRadius: "50%", background: isAdmin ? "#d1fae5" : "#e0f2fe", color: isAdmin ? "#065f46" : "#075985", display: "grid", placeItems: "center", fontSize: 11, fontWeight: 900, flexShrink: 0 }}>
+        {initials(displayName)}
+      </div>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ color: "#111827", fontSize: 13, fontWeight: 850, maxWidth: 130, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{displayName}</div>
+        <div style={{ color: isAdmin ? "#059669" : "#64748b", fontSize: 10, fontWeight: 900, letterSpacing: 0, textTransform: "uppercase" }}>{profile?.role || "member"}</div>
+      </div>
+    </div>
+  );
+}
+
 async function geminiMessage(prompt, maxTokens = 1200, responseMimeType = "text/plain") {
   const cooldownUntil = getGeminiCooldown();
   if (cooldownUntil > Date.now()) {
@@ -635,6 +716,8 @@ export default function App() {
   const [profiles, setProfiles] = useState([]);
   const [screen, setScreen] = useState("list");
   const [active, setActive] = useState(null);
+  const [activeDraftKey, setActiveDraftKey] = useState("");
+  const [draftTick, setDraftTick] = useState(0);
   const [search, setSearch] = useState("");
   const [tagFilter, setTagFilter] = useState("");
   const [customTags, setCustomTags] = useState(() => readJson(CUSTOM_TAGS_KEY, []));
@@ -643,6 +726,7 @@ export default function App() {
   const allTags = useMemo(() => [...DEFAULT_TAGS, ...customTags.filter((tag) => !DEFAULT_TAGS.includes(tag))], [customTags]);
   const isAdmin = profile?.role === "admin";
   const currentUserId = profile?.id || session?.user?.id || "";
+  const meetingDrafts = useMemo(() => currentUserId ? listMeetingDrafts(currentUserId) : [], [currentUserId, draftTick, screen]);
 
   useEffect(() => {
     let cancelled = false;
@@ -741,19 +825,23 @@ export default function App() {
   async function saveMeeting(meeting) {
       if (!hasSupabaseConfig) {
       setSyncStatus(supabaseConfigError);
-      return;
+      return false;
     }
     const clean = cleanMeetingActions({ ...meeting, title: meeting.title.trim(), attendees: meeting.attendees.trim(), body: meeting.body.trim() });
     const record = clean.id ? clean : { ...clean, id: genId(), visibility: "restricted", memberIds: [...new Set([currentUserId, ...(clean.memberIds || [])].filter(Boolean))] };
-    setSyncStatus("Saving to Supabase...");
+      setSyncStatus("Saving to Supabase...");
     try {
       const saved = await upsertMeetingToDb(record);
       const finalRecord = cleanMeetingActions(saved || record);
+      if (activeDraftKey) clearMeetingDraft(activeDraftKey);
+      setDraftTick((value) => value + 1);
       setMeetings((current) => clean.id ? current.map((item) => item.id === finalRecord.id ? finalRecord : item) : [finalRecord, ...current]);
       setSyncStatus("Synced with Supabase");
       setScreen("list");
+      return true;
     } catch {
       setSyncStatus("Save failed. Check Supabase connection, table, and RLS policies.");
+      return false;
     }
   }
 
@@ -768,6 +856,8 @@ export default function App() {
     try {
       const saved = await upsertMeetingToDb(cleanedNext);
       const finalRecord = cleanMeetingActions(saved || cleanedNext);
+      if (activeDraftKey) clearMeetingDraft(activeDraftKey);
+      setDraftTick((value) => value + 1);
       setActive(finalRecord);
       setMeetings((current) => current.map((meeting) => meeting.id === finalRecord.id ? finalRecord : meeting));
       setSyncStatus("Synced with Supabase");
@@ -801,6 +891,17 @@ export default function App() {
     }
   }
 
+  function openDraft(draft) {
+    setActiveDraftKey(draft.draftKey);
+    setActive(cleanMeetingActions(draft));
+    setScreen("form");
+  }
+
+  function deleteDraft(key) {
+    clearMeetingDraft(key);
+    setDraftTick((value) => value + 1);
+  }
+
   if (!authReady) {
     return <LoginScreen status={syncStatus} />;
   }
@@ -810,27 +911,29 @@ export default function App() {
   }
 
   if (screen === "form") {
-    return <MeetingForm data={active} allTags={allTags} customTags={customTags} customColors={customColors} profiles={profiles} currentUserId={currentUserId} isAdmin={isAdmin} onAddTag={addCustomTag} onDeleteTag={deleteCustomTag} onSave={saveMeeting} onBack={() => setScreen("list")} />;
+    return <MeetingForm data={active} draftKey={activeDraftKey} allTags={allTags} customTags={customTags} customColors={customColors} profiles={profiles} currentUserId={currentUserId} isAdmin={isAdmin} onAddTag={addCustomTag} onDeleteTag={deleteCustomTag} onSave={saveMeeting} onBack={() => setScreen("list")} />;
   }
   if (screen === "detail") {
     return <MeetingDetail note={active} customColors={customColors} canEdit={isAdmin} onBack={() => setScreen("list")} onEdit={() => setScreen("form")} onUpdate={updateActive} />;
   }
-  return <MeetingList meetings={meetings} syncStatus={syncStatus} profile={profile} isAdmin={isAdmin} search={search} setSearch={setSearch} tagFilter={tagFilter} setTagFilter={setTagFilter} customColors={customColors} onSignOut={logout} onNew={() => { setActive({ id: "", title: "", date: today(), attendees: "", tags: [], body: "", actions: [], visibility: "restricted", memberIds: currentUserId ? [currentUserId] : [] }); setScreen("form"); }} onView={(meeting) => { setActive(cleanMeetingActions(meeting)); setScreen("detail"); }} onEdit={(meeting) => { setActive(cleanMeetingActions(meeting)); setScreen("form"); }} onDelete={deleteMeeting} />;
+  return <MeetingList meetings={meetings} drafts={meetingDrafts} syncStatus={syncStatus} profile={profile} isAdmin={isAdmin} search={search} setSearch={setSearch} tagFilter={tagFilter} setTagFilter={setTagFilter} customColors={customColors} onSignOut={logout} onNew={() => { const key = meetingDraftKey(currentUserId, "new"); const draft = readMeetingDraft(key); setActiveDraftKey(key); setActive(draft ? { ...draft, isDraft: true } : { id: "", title: "", date: today(), attendees: "", tags: [], body: "", actions: [], visibility: "restricted", memberIds: currentUserId ? [currentUserId] : [] }); setScreen("form"); }} onView={(meeting) => { setActive(cleanMeetingActions(meeting)); setScreen("detail"); }} onEdit={(meeting) => { const key = meetingDraftKey(currentUserId, meeting.id); const draft = readMeetingDraft(key); setActiveDraftKey(key); setActive(cleanMeetingActions(draft ? { ...draft, isDraft: true } : meeting)); setScreen("form"); }} onOpenDraft={openDraft} onDeleteDraft={deleteDraft} onDelete={deleteMeeting} />;
 }
 
-function MeetingList({ meetings, syncStatus, profile, isAdmin, search, setSearch, tagFilter, setTagFilter, customColors, onSignOut, onNew, onView, onEdit, onDelete }) {
+function MeetingList({ meetings, drafts, syncStatus, profile, isAdmin, search, setSearch, tagFilter, setTagFilter, customColors, onSignOut, onNew, onView, onEdit, onOpenDraft, onDeleteDraft, onDelete }) {
   const screen = useResponsive();
   const now = new Date();
-  const usedTags = [...new Set(meetings.flatMap((meeting) => meeting.tags || []))];
-  const filtered = meetings.filter((meeting) => {
+  const draftMeetingIds = new Set((drafts || []).map((draft) => draft.id).filter(Boolean));
+  const displayMeetings = [...(drafts || []), ...meetings.filter((meeting) => !draftMeetingIds.has(meeting.id))];
+  const usedTags = [...new Set(displayMeetings.flatMap((meeting) => meeting.tags || []))];
+  const filtered = displayMeetings.filter((meeting) => {
     const haystack = [meeting.title, meeting.attendees, meeting.body, ...(meeting.tags || [])].join(" ").toLowerCase();
     return (!search || haystack.includes(search.toLowerCase())) && (!tagFilter || (meeting.tags || []).includes(tagFilter));
   }).sort((a, b) => new Date(b.date) - new Date(a.date));
-  const thisMonth = meetings.filter((meeting) => {
+  const thisMonth = displayMeetings.filter((meeting) => {
     const date = new Date(meeting.date + "T00:00:00");
     return date.getMonth() === now.getMonth() && date.getFullYear() === now.getFullYear();
   }).length;
-  const openActions = meetings.reduce((sum, meeting) => sum + (meeting.actions || []).filter((action) => (action.status || "open") === "open").length, 0);
+  const openActions = displayMeetings.reduce((sum, meeting) => sum + (meeting.actions || []).filter((action) => (action.status || "open") === "open").length, 0);
 
   return (
     <div style={pageStyle}>
@@ -838,20 +941,15 @@ function MeetingList({ meetings, syncStatus, profile, isAdmin, search, setSearch
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: screen.isMobile ? "stretch" : "center", flexDirection: screen.isMobile ? "column" : "row", gap: 12, marginBottom: 18 }}>
           <div>
             <div style={{ fontSize: screen.isMobile ? 22 : 26, fontWeight: 900 }}><span style={{ color: "#1D9E75" }}>OneRoot</span> Meetings</div>
-            <div style={smallMuted}>Meeting notes, decisions, and action follow-through</div>
-            <div style={{ ...smallMuted, color: syncStatus.includes("Supabase") && !syncStatus.includes("failed") && !syncStatus.includes("unavailable") ? "#1D9E75" : "#8a8a82", marginTop: 3 }}>{syncStatus}</div>
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: screen.isMobile ? "stretch" : "center", flexDirection: screen.isMobile ? "column" : "row" }}>
-            <div style={{ ...smallMuted, textAlign: screen.isMobile ? "left" : "right" }}>
-              {profile?.full_name || profile?.email || "Signed in"}
-              {profile?.role && <span style={{ marginLeft: 6, color: isAdmin ? "#1D9E75" : "#777", fontWeight: 800 }}>{profile.role}</span>}
-            </div>
+            <AccountChip profile={profile} isAdmin={isAdmin} />
             {isAdmin && <Button tone="primary" onClick={onNew} style={screen.isMobile ? { width: "100%" } : null}>+ New Meeting</Button>}
             <Button onClick={onSignOut} style={screen.isMobile ? { width: "100%" } : null}>Sign Out</Button>
           </div>
         </div>
         <div style={{ display: "grid", gridTemplateColumns: screen.isMobile ? "1fr" : "repeat(3, minmax(0, 1fr))", gap: 10, marginBottom: 14 }}>
-          {[["Total", meetings.length], ["This month", thisMonth], ["Open actions", openActions]].map(([label, value]) => (
+          {[["Total", displayMeetings.length], ["This month", thisMonth], ["Open actions", openActions]].map(([label, value]) => (
             <div key={label} style={cardStyle}>
               <div style={{ ...smallMuted, textTransform: "uppercase", fontWeight: 800 }}>{label}</div>
               <div style={{ fontSize: 28, fontWeight: 900 }}>{value}</div>
@@ -865,23 +963,41 @@ function MeetingList({ meetings, syncStatus, profile, isAdmin, search, setSearch
         </div>
         {filtered.length === 0 ? (
           <div style={{ ...cardStyle, textAlign: "center", padding: 44, color: "#888" }}>No meetings found.</div>
-        ) : filtered.map((meeting) => {
+        ) : filtered.map((meeting, index) => {
           const open = (meeting.actions || []).filter((action) => (action.status || "open") === "open").length;
+          const color = MEETING_CARD_COLORS[index % MEETING_CARD_COLORS.length];
+          const cardColor = meeting.isDraft ? { background: "#fffdf2", border: "#fde68a", accent: "#ca8a04" } : color;
           return (
-            <div key={meeting.id} style={{ ...cardStyle, marginBottom: 10 }}>
+            <div key={meeting.draftKey || meeting.id} style={{ ...cardStyle, background: cardColor.background, borderColor: cardColor.border, borderLeft: "5px solid " + cardColor.accent, marginBottom: 10 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 10 }}>
                 <div>
-                  <div style={{ fontSize: 17, fontWeight: 850 }}>{meeting.title}</div>
-                  <div style={{ ...smallMuted, marginTop: 3 }}>{fmtDate(meeting.date)}{meeting.attendees ? " · " + meeting.attendees : ""}</div>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                    <div style={{ fontSize: 17, fontWeight: 850 }}>{meeting.title || "Untitled meeting draft"}</div>
+                    {meeting.isDraft && <span style={{ background: "#fef3c7", color: "#92400e", borderRadius: 999, padding: "3px 8px", fontSize: 11, fontWeight: 900 }}>Draft</span>}
+                  </div>
+                  <div style={{ ...smallMuted, marginTop: 3 }}>
+                    {fmtDate(meeting.date)}
+                    {meeting.attendees ? " · " + meeting.attendees : ""}
+                    {meeting.isDraft && meeting.draftSavedAt ? " · saved " + new Date(meeting.draftSavedAt).toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" }) : ""}
+                  </div>
                 </div>
                 {open > 0 && <span style={{ background: "#fef3c7", color: "#92400e", borderRadius: 999, padding: "4px 9px", fontSize: 11, fontWeight: 850 }}>{open} open</span>}
               </div>
               {(meeting.tags || []).length > 0 && <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10 }}>{meeting.tags.map((tag) => <TagChip key={tag} tag={tag} customColors={customColors} />)}</div>}
               {meeting.body && <div style={{ marginTop: 9, color: "#666", fontSize: 13, lineHeight: 1.55, display: "-webkit-box", WebkitLineClamp: 2, WebkitBoxOrient: "vertical", overflow: "hidden" }}>{meeting.body}</div>}
               <div style={{ display: "flex", gap: 7, borderTop: "1px solid #f0f0ec", marginTop: 13, paddingTop: 13, flexWrap: "wrap" }}>
-                <Button onClick={() => onView(meeting)} style={screen.isMobile ? { flex: "1 1 30%" } : null}>View</Button>
-                {isAdmin && <Button onClick={() => onEdit(meeting)} style={screen.isMobile ? { flex: "1 1 30%" } : null}>Edit</Button>}
-                {isAdmin && <Button tone="danger" onClick={() => onDelete(meeting.id)} style={screen.isMobile ? { flex: "1 1 30%" } : null}>Delete</Button>}
+                {meeting.isDraft ? (
+                  <>
+                    <Button tone="primary" onClick={() => onOpenDraft(meeting)} style={screen.isMobile ? { flex: "1 1 30%" } : null}>Continue Draft</Button>
+                    <Button tone="danger" onClick={() => onDeleteDraft(meeting.draftKey)} style={screen.isMobile ? { flex: "1 1 30%" } : null}>Delete Draft</Button>
+                  </>
+                ) : (
+                  <>
+                    <Button onClick={() => onView(meeting)} style={screen.isMobile ? { flex: "1 1 30%" } : null}>View</Button>
+                    {isAdmin && <Button onClick={() => onEdit(meeting)} style={screen.isMobile ? { flex: "1 1 30%" } : null}>Edit</Button>}
+                    {isAdmin && <Button tone="danger" onClick={() => onDelete(meeting.id)} style={screen.isMobile ? { flex: "1 1 30%" } : null}>Delete</Button>}
+                  </>
+                )}
               </div>
             </div>
           );
@@ -891,7 +1007,7 @@ function MeetingList({ meetings, syncStatus, profile, isAdmin, search, setSearch
   );
 }
 
-function MeetingForm({ data, allTags, customTags, customColors, profiles, currentUserId, isAdmin, onAddTag, onDeleteTag, onSave, onBack }) {
+function MeetingForm({ data, draftKey, allTags, customTags, customColors, profiles, currentUserId, isAdmin, onAddTag, onDeleteTag, onSave, onBack }) {
   const screen = useResponsive();
   const [form, setForm] = useState(() => cleanMeetingActions({ ...data, actions: data.actions || [] }));
   const [titleError, setTitleError] = useState(false);
@@ -902,6 +1018,7 @@ function MeetingForm({ data, allTags, customTags, customColors, profiles, curren
   const [busy, setBusy] = useState(false);
   const [recording, setRecording] = useState(false);
   const [interim, setInterim] = useState("");
+  const [draftSavedAt, setDraftSavedAt] = useState("");
   const [voiceMode, setVoiceMode] = useState("server");
   const [voiceLang, setVoiceLang] = useState("en-IN");
   const speechRef = useRef(null);
@@ -910,6 +1027,9 @@ function MeetingForm({ data, allTags, customTags, customColors, profiles, curren
   const mediaStreamRef = useRef(null);
   const audioChunksRef = useRef([]);
   const notesRef = useRef(null);
+  const initialFormRef = useRef(cleanMeetingActions(meetingDraftPayload(data)));
+  const formRef = useRef(form);
+  const savingRef = useRef(false);
   const actionsRef = useRef(form.actions || []);
 
   const people = [...new Set([...namesFromAttendees(form.attendees), ...manualPeople, ...(form.actions || []).flatMap((action) => [action.assignee, action.delegate]).filter(Boolean)])];
@@ -919,16 +1039,46 @@ function MeetingForm({ data, allTags, customTags, customColors, profiles, curren
 
   useEffect(() => {
     actionsRef.current = form.actions || [];
+    formRef.current = form;
   }, [form.actions]);
 
   useEffect(() => {
+    formRef.current = form;
+  }, [form]);
+
+  function shouldSaveDraft(meeting) {
+    if (data?.isDraft) return hasMeetingDraftContent(meeting);
+    return hasMeetingDraftContent(meeting) && JSON.stringify(meetingDraftPayload(meeting)) !== JSON.stringify(meetingDraftPayload(initialFormRef.current));
+  }
+
+  useEffect(() => {
+    if (!draftKey) return;
+    const timeout = window.setTimeout(() => {
+      const draft = cleanMeetingActions(form);
+      if (shouldSaveDraft(draft)) {
+        writeMeetingDraft(draftKey, draft);
+        setDraftSavedAt(new Date().toLocaleTimeString("en-IN", { hour: "numeric", minute: "2-digit" }));
+      }
+    }, 400);
+    return () => window.clearTimeout(timeout);
+  }, [draftKey, form]);
+
+  useEffect(() => {
     return () => {
+      const draft = cleanMeetingActions(formRef.current);
+      if (draftKey && !savingRef.current && shouldSaveDraft(draft)) writeMeetingDraft(draftKey, draft);
       speechRef.current?.stop();
       mediaRecorderRef.current?.stop();
       speechSocketRef.current?.close();
       mediaStreamRef.current?.getTracks().forEach((track) => track.stop());
     };
-  }, []);
+  }, [draftKey]);
+
+  function backToList() {
+    const draft = cleanMeetingActions(formRef.current);
+    if (draftKey && shouldSaveDraft(draft)) writeMeetingDraft(draftKey, draft);
+    onBack();
+  }
 
   function setField(key, value) {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -1156,20 +1306,25 @@ function MeetingForm({ data, allTags, customTags, customColors, profiles, curren
     setRecording(false);
   }
 
-  function save() {
+  async function save() {
     if (!form.title.trim()) {
       setTitleError(true);
       return;
     }
-    onSave({ ...form, actions: dedupeActions(form.actions || []) });
+    savingRef.current = true;
+    const saved = await onSave({ ...form, actions: dedupeActions(form.actions || []) });
+    if (!saved) savingRef.current = false;
   }
 
   return (
     <div style={pageStyle}>
       <div style={{ ...wrapStyle, maxWidth: 820, padding: screen.isMobile ? "12px 10px 26px" : wrapStyle.padding }}>
-        <Button onClick={onBack}>Back</Button>
+        <Button onClick={backToList}>Back</Button>
         <div style={{ ...cardStyle, marginTop: 14, padding: screen.isMobile ? 12 : cardStyle.padding }}>
-          <div style={{ fontSize: screen.isMobile ? 19 : 22, fontWeight: 900, marginBottom: 16 }}>{form.id ? "Edit Meeting" : "New Meeting"}</div>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, alignItems: screen.isMobile ? "flex-start" : "center", flexDirection: screen.isMobile ? "column" : "row", marginBottom: 16 }}>
+            <div style={{ fontSize: screen.isMobile ? 19 : 22, fontWeight: 900 }}>{form.id ? "Edit Meeting" : "New Meeting"}</div>
+            {draftSavedAt && <div style={{ ...smallMuted, color: "#059669", fontWeight: 800 }}>Draft saved {draftSavedAt}</div>}
+          </div>
           <div style={{ display: "grid", gridTemplateColumns: screen.isMobile ? "1fr" : "minmax(0, 1.4fr) 180px", gap: 12 }}>
             <div>
               <label style={labelStyle}>Title *</label>
@@ -1309,7 +1464,7 @@ function MeetingForm({ data, allTags, customTags, customColors, profiles, curren
             </div>
           ))}
           <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, borderTop: "1px solid #f0f0ec", marginTop: 16, paddingTop: 14, flexDirection: screen.isMobile ? "column-reverse" : "row" }}>
-            <Button onClick={onBack} style={screen.isMobile ? { width: "100%" } : null}>Cancel</Button>
+            <Button onClick={backToList} style={screen.isMobile ? { width: "100%" } : null}>Cancel</Button>
             <Button tone="primary" onClick={save} style={screen.isMobile ? { width: "100%" } : null}>Save Meeting</Button>
           </div>
         </div>
