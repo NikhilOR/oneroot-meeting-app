@@ -1,3 +1,5 @@
+import { createClient } from "@supabase/supabase-js";
+
 const rawSupabaseUrl = import.meta.env.VITE_SUPABASE_URL || "";
 const supabaseUrl = rawSupabaseUrl.replace(/\/$/, "");
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
@@ -11,6 +13,7 @@ export const supabaseConfigError = !rawSupabaseUrl
       : "";
 
 export const hasSupabaseConfig = !supabaseConfigError;
+export const supabase = hasSupabaseConfig ? createClient(supabaseUrl, supabaseAnonKey) : null;
 
 function toRow(meeting) {
   return {
@@ -21,6 +24,7 @@ function toRow(meeting) {
     tags: meeting.tags || [],
     body: meeting.body || "",
     actions: meeting.actions || [],
+    visibility: meeting.visibility || "restricted",
     updated_at: new Date().toISOString(),
   };
 }
@@ -34,51 +38,140 @@ function fromRow(row) {
     tags: row.tags || [],
     body: row.body || "",
     actions: row.actions || [],
+    visibility: row.visibility || "restricted",
+    memberIds: (row.members || row.or_meeting_members || []).map((member) => member.user_id).filter(Boolean),
+    createdBy: row.created_by,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
-async function supabaseRest(path, options = {}) {
-  if (!hasSupabaseConfig) throw new Error(supabaseConfigError);
-  const response = await fetch(`${supabaseUrl}/rest/v1/${path}`, {
-    ...options,
-    headers: {
-      apikey: supabaseAnonKey,
-      Authorization: `Bearer ${supabaseAnonKey}`,
-      "Content-Type": "application/json",
-      ...(options.headers || {}),
-    },
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(text || "Supabase request failed");
-  }
-  if (response.status === 204) return null;
-  return response.json();
+function assertSupabase() {
+  if (!hasSupabaseConfig || !supabase) throw new Error(supabaseConfigError);
+}
+
+export async function signInWithEmail(email, password) {
+  assertSupabase();
+  const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+  if (error) throw error;
+  return data;
+}
+
+export async function signOut() {
+  assertSupabase();
+  const { error } = await supabase.auth.signOut();
+  if (error) throw error;
+}
+
+export async function getCurrentSession() {
+  assertSupabase();
+  const { data, error } = await supabase.auth.getSession();
+  if (error) throw error;
+  return data.session;
+}
+
+export function onAuthChanged(callback) {
+  if (!supabase) return () => {};
+  const { data } = supabase.auth.onAuthStateChange((_event, session) => callback(session));
+  return () => data.subscription.unsubscribe();
+}
+
+export async function fetchCurrentProfile() {
+  assertSupabase();
+  const { data: userData, error: userError } = await supabase.auth.getUser();
+  if (userError) throw userError;
+  const user = userData.user;
+  if (!user) return null;
+
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("id, full_name, email, role")
+    .eq("id", user.id)
+    .maybeSingle();
+  if (error) throw error;
+  if (data) return data;
+
+  const fallbackProfile = {
+    id: user.id,
+    full_name: user.user_metadata?.full_name || user.email?.split("@")[0] || "User",
+    email: user.email || "",
+    role: "member",
+  };
+  const { data: inserted, error: insertError } = await supabase
+    .from("profiles")
+    .insert(fallbackProfile)
+    .select("id, full_name, email, role")
+    .single();
+  if (insertError) throw insertError;
+  return inserted;
+}
+
+export async function fetchProfilesFromDb() {
+  assertSupabase();
+  const { data, error } = await supabase
+    .from("profiles")
+    .select("id, full_name, email, role")
+    .order("full_name", { ascending: true });
+  if (error) throw error;
+  return data || [];
 }
 
 export async function fetchMeetingsFromDb() {
   if (!hasSupabaseConfig) return null;
-  const data = await supabaseRest("or_meetings?select=*&order=meeting_date.desc");
+  assertSupabase();
+  const { data, error } = await supabase
+    .from("or_meetings")
+    .select("*, members:or_meeting_members(user_id)")
+    .order("meeting_date", { ascending: false });
+  if (error) throw error;
   return (data || []).map(fromRow);
 }
 
 export async function upsertMeetingToDb(meeting) {
   if (!hasSupabaseConfig) return null;
-  const data = await supabaseRest("or_meetings?on_conflict=id&select=*", {
-    method: "POST",
-    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
-    body: JSON.stringify(toRow(meeting)),
-  });
-  return fromRow(Array.isArray(data) ? data[0] : data);
+  assertSupabase();
+  const { data: userData, error: userError } = await supabase.auth.getUser();
+  if (userError) throw userError;
+  const userId = userData.user?.id;
+  const row = toRow(meeting);
+  if (!meeting.createdBy && userId) row.created_by = userId;
+
+  const { data, error } = await supabase
+    .from("or_meetings")
+    .upsert(row, { onConflict: "id" })
+    .select("*, members:or_meeting_members(user_id)")
+    .single();
+  if (error) throw error;
+
+  if (Array.isArray(meeting.memberIds)) {
+    const memberIds = [...new Set([...(meeting.memberIds || []), userId].filter(Boolean))];
+    const { error: deleteError } = await supabase
+      .from("or_meeting_members")
+      .delete()
+      .eq("meeting_id", row.id);
+    if (deleteError) throw deleteError;
+
+    if (memberIds.length) {
+      const { error: memberError } = await supabase
+        .from("or_meeting_members")
+        .insert(memberIds.map((memberId) => ({ meeting_id: row.id, user_id: memberId })));
+      if (memberError) throw memberError;
+    }
+  }
+
+  const { data: refreshed, error: refreshError } = await supabase
+    .from("or_meetings")
+    .select("*, members:or_meeting_members(user_id)")
+    .eq("id", row.id)
+    .single();
+  if (refreshError) throw refreshError;
+  return fromRow(refreshed || data);
 }
 
 export async function deleteMeetingFromDb(id) {
   if (!hasSupabaseConfig) return null;
-  await supabaseRest(`or_meetings?id=eq.${encodeURIComponent(id)}`, {
-    method: "DELETE",
-    headers: { Prefer: "return=minimal" },
-  });
+  assertSupabase();
+  const { error } = await supabase.from("or_meetings").delete().eq("id", id);
+  if (error) throw error;
   return true;
 }
