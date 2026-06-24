@@ -57,6 +57,19 @@ export async function signInWithEmail(email, password) {
   return data;
 }
 
+export async function signUpWithEmail(fullName, email, password) {
+  assertSupabase();
+  const { data, error } = await supabase.auth.signUp({
+    email,
+    password,
+    options: {
+      data: { full_name: fullName },
+    },
+  });
+  if (error) throw error;
+  return data;
+}
+
 export async function signOut() {
   assertSupabase();
   const { error } = await supabase.auth.signOut();

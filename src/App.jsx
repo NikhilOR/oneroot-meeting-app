@@ -9,6 +9,7 @@ import {
   onAuthChanged,
   signInWithEmail,
   signOut,
+  signUpWithEmail,
   supabaseConfigError,
   upsertMeetingToDb,
 } from "./supabaseMeetings";
@@ -377,24 +378,37 @@ function Button({ children, tone, style, ...props }) {
 
 function LoginScreen({ status }) {
   const screen = useResponsive();
+  const [mode, setMode] = useState("signin");
+  const [fullName, setFullName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [message, setMessage] = useState(status || "");
   const [busy, setBusy] = useState(false);
+  const isSignup = mode === "signup";
 
   async function submit(event) {
     event.preventDefault();
-    if (!email.trim() || !password) {
-      setMessage("Enter your email and password.");
+    if (isSignup && !fullName.trim()) {
+      setMessage("Enter your full name.");
+      return;
+    }
+    if (!email.trim() || password.length < 6) {
+      setMessage("Enter your email and a password with at least 6 characters.");
       return;
     }
     setBusy(true);
-    setMessage("Signing in...");
+    setMessage(isSignup ? "Creating account..." : "Signing in...");
     try {
-      await signInWithEmail(email.trim(), password);
-      setMessage("Signed in.");
+      if (isSignup) {
+        const result = await signUpWithEmail(fullName.trim(), email.trim(), password);
+        setMessage(result.session ? "Account created and signed in." : "Account created. Check your email if confirmation is required, then sign in.");
+        if (!result.session) setMode("signin");
+      } else {
+        await signInWithEmail(email.trim(), password);
+        setMessage("Signed in.");
+      }
     } catch (error) {
-      setMessage(error?.message || "Sign in failed.");
+      setMessage(error?.message || (isSignup ? "Account creation failed." : "Sign in failed."));
     } finally {
       setBusy(false);
     }
@@ -405,16 +419,33 @@ function LoginScreen({ status }) {
       <div style={{ ...wrapStyle, maxWidth: 420, paddingTop: screen.isMobile ? 36 : 80 }}>
         <form onSubmit={submit} style={cardStyle}>
           <div style={{ fontSize: 24, fontWeight: 900, marginBottom: 4 }}><span style={{ color: "#1D9E75" }}>OneRoot</span> Meetings</div>
-          <div style={{ ...smallMuted, marginBottom: 18 }}>Sign in to view your meetings</div>
+          <div style={{ ...smallMuted, marginBottom: 18 }}>{isSignup ? "Create your account to be added to meetings" : "Sign in to view your meetings"}</div>
+          {isSignup && (
+            <div style={{ marginBottom: 12 }}>
+              <label style={labelStyle}>Full Name</label>
+              <input value={fullName} onChange={(event) => setFullName(event.target.value)} type="text" autoComplete="name" style={inputStyle} />
+            </div>
+          )}
           <div>
             <label style={labelStyle}>Email</label>
             <input value={email} onChange={(event) => setEmail(event.target.value)} type="email" autoComplete="email" style={inputStyle} />
           </div>
           <div style={{ marginTop: 12 }}>
             <label style={labelStyle}>Password</label>
-            <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete="current-password" style={inputStyle} />
+            <input value={password} onChange={(event) => setPassword(event.target.value)} type="password" autoComplete={isSignup ? "new-password" : "current-password"} style={inputStyle} />
           </div>
-          <Button type="submit" tone="primary" disabled={busy || !hasSupabaseConfig} style={{ width: "100%", marginTop: 16 }}>{busy ? "Signing in..." : "Sign In"}</Button>
+          <Button type="submit" tone="primary" disabled={busy || !hasSupabaseConfig} style={{ width: "100%", marginTop: 16 }}>{busy ? (isSignup ? "Creating..." : "Signing in...") : (isSignup ? "Create Account" : "Sign In")}</Button>
+          <Button
+            type="button"
+            disabled={busy}
+            onClick={() => {
+              setMode(isSignup ? "signin" : "signup");
+              setMessage("");
+            }}
+            style={{ width: "100%", marginTop: 8 }}
+          >
+            {isSignup ? "I already have an account" : "Create account"}
+          </Button>
           {message && <div style={{ ...smallMuted, marginTop: 12, color: message.includes("failed") || message.includes("Missing") ? "#b45309" : "#777" }}>{message}</div>}
         </form>
       </div>
