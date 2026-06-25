@@ -95,12 +95,35 @@ set search_path = public
 as $$
   select
     public.is_admin()
+    or exists (
+      select 1
+      from public.or_meetings m
+      where m.id = target_meeting_id
+        and m.created_by = auth.uid()
+    )
     or meeting_visibility = 'legacy_all'
     or exists (
       select 1
       from public.or_meeting_members mm
       where mm.meeting_id = target_meeting_id
         and mm.user_id = auth.uid()
+    );
+$$;
+
+create or replace function public.can_manage_meeting_members(target_meeting_id text)
+returns boolean
+language sql
+security definer
+stable
+set search_path = public
+as $$
+  select
+    public.is_admin()
+    or exists (
+      select 1
+      from public.or_meetings m
+      where m.id = target_meeting_id
+        and m.created_by = auth.uid()
     );
 $$;
 
@@ -138,6 +161,7 @@ drop policy if exists "Allow anon update meetings" on public.or_meetings;
 drop policy if exists "Allow anon delete meetings" on public.or_meetings;
 drop policy if exists "Authenticated users can read accessible meetings" on public.or_meetings;
 drop policy if exists "Admins can create meetings" on public.or_meetings;
+drop policy if exists "Authenticated users can create meetings" on public.or_meetings;
 drop policy if exists "Admins can update meetings" on public.or_meetings;
 drop policy if exists "Admins can delete meetings" on public.or_meetings;
 
@@ -147,11 +171,11 @@ for select
 to authenticated
 using (public.can_access_meeting(id, visibility));
 
-create policy "Admins can create meetings"
+create policy "Authenticated users can create meetings"
 on public.or_meetings
 for insert
 to authenticated
-with check (public.is_admin() and created_by = auth.uid());
+with check (created_by = auth.uid());
 
 create policy "Admins can update meetings"
 on public.or_meetings
@@ -168,6 +192,7 @@ using (public.is_admin());
 
 drop policy if exists "Meeting members readable for accessible meetings" on public.or_meeting_members;
 drop policy if exists "Admins manage meeting members" on public.or_meeting_members;
+drop policy if exists "Admins and meeting creators manage meeting members" on public.or_meeting_members;
 
 create policy "Meeting members readable for accessible meetings"
 on public.or_meeting_members
@@ -175,12 +200,12 @@ for select
 to authenticated
 using (public.can_access_meeting(meeting_id, 'restricted'));
 
-create policy "Admins manage meeting members"
+create policy "Admins and meeting creators manage meeting members"
 on public.or_meeting_members
 for all
 to authenticated
-using (public.is_admin())
-with check (public.is_admin());
+using (public.can_manage_meeting_members(meeting_id))
+with check (public.can_manage_meeting_members(meeting_id));
 
 create index if not exists or_meetings_meeting_date_idx on public.or_meetings (meeting_date desc);
 create index if not exists or_meetings_tags_idx on public.or_meetings using gin (tags);

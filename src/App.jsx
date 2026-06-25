@@ -944,7 +944,7 @@ function MeetingList({ meetings, drafts, syncStatus, profile, isAdmin, search, s
           </div>
           <div style={{ display: "flex", gap: 8, alignItems: screen.isMobile ? "stretch" : "center", flexDirection: screen.isMobile ? "column" : "row" }}>
             <AccountChip profile={profile} isAdmin={isAdmin} />
-            {isAdmin && <Button tone="primary" onClick={onNew} style={screen.isMobile ? { width: "100%" } : null}>+ New Meeting</Button>}
+            <Button tone="primary" onClick={onNew} style={screen.isMobile ? { width: "100%" } : null}>+ New Meeting</Button>
             <Button onClick={onSignOut} style={screen.isMobile ? { width: "100%" } : null}>Sign Out</Button>
           </div>
         </div>
