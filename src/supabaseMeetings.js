@@ -156,19 +156,24 @@ export async function upsertMeetingToDb(meeting) {
     .single();
   if (error) throw error;
 
+  let accessWarning = "";
   if (Array.isArray(meeting.memberIds)) {
-    const memberIds = [...new Set([...(meeting.memberIds || []), userId].filter(Boolean))];
-    const { error: deleteError } = await supabase
-      .from("or_meeting_members")
-      .delete()
-      .eq("meeting_id", row.id);
-    if (deleteError) throw deleteError;
-
-    if (memberIds.length) {
-      const { error: memberError } = await supabase
+    try {
+      const memberIds = [...new Set([...(meeting.memberIds || []), userId].filter(Boolean))];
+      const { error: deleteError } = await supabase
         .from("or_meeting_members")
-        .insert(memberIds.map((memberId) => ({ meeting_id: row.id, user_id: memberId })));
-      if (memberError) throw memberError;
+        .delete()
+        .eq("meeting_id", row.id);
+      if (deleteError) throw deleteError;
+
+      if (memberIds.length) {
+        const { error: memberError } = await supabase
+          .from("or_meeting_members")
+          .upsert(memberIds.map((memberId) => ({ meeting_id: row.id, user_id: memberId })), { onConflict: "meeting_id,user_id" });
+        if (memberError) throw memberError;
+      }
+    } catch (error) {
+      accessWarning = error?.message || "Meeting saved, but access members could not be updated.";
     }
   }
 
@@ -178,7 +183,28 @@ export async function upsertMeetingToDb(meeting) {
     .eq("id", row.id)
     .single();
   if (refreshError) throw refreshError;
-  return fromRow(refreshed || data);
+  const result = fromRow(refreshed || data);
+  if (accessWarning) result.accessWarning = `Meeting saved, but access members could not be updated: ${accessWarning}`;
+  return result;
+}
+
+export async function updateActionRemarksInDb(meetingId, actionId, remarks) {
+  if (!hasSupabaseConfig) return null;
+  assertSupabase();
+  const { error } = await supabase.rpc("update_meeting_action_remarks", {
+    target_meeting_id: meetingId,
+    target_action_id: actionId,
+    next_remarks: remarks || "",
+  });
+  if (error) throw error;
+
+  const { data: refreshed, error: refreshError } = await supabase
+    .from("or_meetings")
+    .select("*, members:or_meeting_members(user_id)")
+    .eq("id", meetingId)
+    .single();
+  if (refreshError) throw refreshError;
+  return fromRow(refreshed);
 }
 
 export async function deleteMeetingFromDb(id) {

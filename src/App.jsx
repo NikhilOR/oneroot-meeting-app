@@ -11,6 +11,7 @@ import {
   signOut,
   signUpWithEmail,
   supabaseConfigError,
+  updateActionRemarksInDb,
   upsertMeetingToDb,
 } from "./supabaseMeetings";
 
@@ -339,6 +340,18 @@ function textMentionsName(text, name) {
   return note.split(" ").includes(person) || note.includes(person);
 }
 
+function profileMentionedInMeeting(meeting, profile, userId) {
+  if (!meeting || !profile) return false;
+  if ((meeting.memberIds || []).includes(userId)) return true;
+  const profileTexts = [profile.full_name, profile.email].filter(Boolean);
+  const meetingText = [
+    meeting.attendees,
+    meeting.body,
+    ...(meeting.actions || []).flatMap((action) => [action.text, action.assignee, action.delegate, action.remarks]),
+  ].join(" ");
+  return profileTexts.some((value) => textMentionsName(meetingText, value));
+}
+
 function mergeExtractedAction(existing, extracted, correctedNotes) {
   return {
     ...existing,
@@ -439,6 +452,48 @@ function Button({ children, tone, style, ...props }) {
     <button {...props} style={{ border: "1px solid " + t.border, background: t.background, color: t.color, borderRadius: 8, padding: "9px 13px", fontSize: 13, fontWeight: 750, cursor: props.disabled ? "not-allowed" : "pointer", opacity: props.disabled ? 0.6 : 1, ...style }}>
       {children}
     </button>
+  );
+}
+
+function Modal({ title, message, children, onClose }) {
+  return (
+    <div style={{ position: "fixed", inset: 0, zIndex: 50, background: "rgba(17,24,39,0.42)", display: "grid", placeItems: "center", padding: 16 }} role="dialog" aria-modal="true">
+      <div style={{ ...cardStyle, width: "min(420px, 100%)", padding: 18, boxShadow: "0 24px 70px rgba(15,23,42,0.22)" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", gap: 12, alignItems: "flex-start" }}>
+          <div>
+            <div style={{ fontSize: 18, fontWeight: 900, color: "#111827" }}>{title}</div>
+            {message && <div style={{ marginTop: 6, color: "#555", fontSize: 13, lineHeight: 1.55 }}>{message}</div>}
+          </div>
+          {onClose && (
+            <button type="button" onClick={onClose} title="Close" style={{ border: 0, background: "transparent", color: "#6b7280", cursor: "pointer", fontSize: 20, lineHeight: 1, padding: 0 }}>
+              x
+            </button>
+          )}
+        </div>
+        {children}
+      </div>
+    </div>
+  );
+}
+
+function ConfirmModal({ title, message, confirmText = "Confirm", cancelText = "Cancel", tone = "primary", busy, onConfirm, onCancel }) {
+  return (
+    <Modal title={title} message={message}>
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, marginTop: 18, flexWrap: "wrap" }}>
+        <Button type="button" disabled={busy} onClick={onCancel}>{cancelText}</Button>
+        <Button type="button" tone={tone} disabled={busy} onClick={onConfirm}>{busy ? "Working..." : confirmText}</Button>
+      </div>
+    </Modal>
+  );
+}
+
+function SavingModal({ title = "Saving meeting", message = "Please wait while this meeting is saved." }) {
+  return (
+    <Modal title={title} message={message}>
+      <div style={{ marginTop: 16, height: 8, borderRadius: 999, background: "#ecfdf5", overflow: "hidden" }}>
+        <div style={{ width: "42%", height: "100%", borderRadius: 999, background: "#1D9E75" }} />
+      </div>
+    </Modal>
   );
 }
 
@@ -823,24 +878,24 @@ export default function App() {
   }
 
   async function saveMeeting(meeting) {
-      if (!hasSupabaseConfig) {
+    if (!hasSupabaseConfig) {
       setSyncStatus(supabaseConfigError);
       return false;
     }
     const clean = cleanMeetingActions({ ...meeting, title: meeting.title.trim(), attendees: meeting.attendees.trim(), body: meeting.body.trim() });
     const record = clean.id ? clean : { ...clean, id: genId(), visibility: "restricted", memberIds: [...new Set([currentUserId, ...(clean.memberIds || [])].filter(Boolean))] };
-      setSyncStatus("Saving to Supabase...");
+    setSyncStatus("Saving to Supabase...");
     try {
       const saved = await upsertMeetingToDb(record);
       const finalRecord = cleanMeetingActions(saved || record);
       if (activeDraftKey) clearMeetingDraft(activeDraftKey);
       setDraftTick((value) => value + 1);
       setMeetings((current) => clean.id ? current.map((item) => item.id === finalRecord.id ? finalRecord : item) : [finalRecord, ...current]);
-      setSyncStatus("Synced with Supabase");
+      setSyncStatus(finalRecord.accessWarning || "Synced with Supabase");
       setScreen("list");
       return true;
-    } catch {
-      setSyncStatus("Save failed. Check Supabase connection, table, and RLS policies.");
+    } catch (error) {
+      setSyncStatus(`Save failed: ${error?.message || "Check Supabase connection, table, and RLS policies."}`);
       return false;
     }
   }
@@ -860,25 +915,51 @@ export default function App() {
       setDraftTick((value) => value + 1);
       setActive(finalRecord);
       setMeetings((current) => current.map((meeting) => meeting.id === finalRecord.id ? finalRecord : meeting));
+      setSyncStatus(finalRecord.accessWarning || "Synced with Supabase");
+    } catch (error) {
+      setSyncStatus(`Save failed: ${error?.message || "Check Supabase connection, table, and RLS policies."}`);
+    }
+  }
+
+  async function updateActionRemarks(meetingId, actionId, remarks) {
+    if (!hasSupabaseConfig) {
+      setSyncStatus(supabaseConfigError);
+      return;
+    }
+    const source = active?.id === meetingId ? active : meetings.find((meeting) => meeting.id === meetingId);
+    if (!source) return;
+    const optimistic = cleanMeetingActions({
+      ...source,
+      actions: (source.actions || []).map((action) => action.id === actionId ? { ...action, remarks } : action),
+    });
+    if (active?.id === meetingId) setActive(optimistic);
+    setMeetings((current) => current.map((meeting) => meeting.id === meetingId ? optimistic : meeting));
+    setSyncStatus("Saving remark to Supabase...");
+    try {
+      const saved = await updateActionRemarksInDb(meetingId, actionId, remarks);
+      const finalRecord = cleanMeetingActions(saved || optimistic);
+      if (active?.id === meetingId) setActive(finalRecord);
+      setMeetings((current) => current.map((meeting) => meeting.id === meetingId ? finalRecord : meeting));
       setSyncStatus("Synced with Supabase");
-    } catch {
-      setSyncStatus("Save failed. Check Supabase connection, table, and RLS policies.");
+    } catch (error) {
+      setSyncStatus(`Remark save failed: ${error?.message || "Check Supabase connection, table, and RLS policies."}`);
     }
   }
 
   async function deleteMeeting(id) {
-    if (!window.confirm("Delete this meeting?")) return;
     if (!hasSupabaseConfig) {
       setSyncStatus(supabaseConfigError);
-      return;
+      return false;
     }
     setSyncStatus("Deleting from Supabase...");
     try {
       await deleteMeetingFromDb(id);
       setMeetings((current) => current.filter((meeting) => meeting.id !== id));
       setSyncStatus("Synced with Supabase");
-    } catch {
-      setSyncStatus("Delete failed. Check Supabase connection, table, and RLS policies.");
+      return true;
+    } catch (error) {
+      setSyncStatus(`Delete failed: ${error?.message || "Check Supabase connection, table, and RLS policies."}`);
+      return false;
     }
   }
 
@@ -914,13 +995,17 @@ export default function App() {
     return <MeetingForm data={active} draftKey={activeDraftKey} allTags={allTags} customTags={customTags} customColors={customColors} profiles={profiles} currentUserId={currentUserId} isAdmin={isAdmin} onAddTag={addCustomTag} onDeleteTag={deleteCustomTag} onSave={saveMeeting} onBack={() => setScreen("list")} />;
   }
   if (screen === "detail") {
-    return <MeetingDetail note={active} customColors={customColors} canEdit={isAdmin} onBack={() => setScreen("list")} onEdit={() => setScreen("form")} onUpdate={updateActive} />;
+    const canEditActive = isAdmin || active.createdBy === currentUserId;
+    const canRemarkActive = canEditActive || (active.memberIds || []).includes(currentUserId);
+    return <MeetingDetail note={active} customColors={customColors} canEdit={canEditActive} canRemark={canRemarkActive} onBack={() => setScreen("list")} onEdit={() => setScreen("form")} onUpdate={updateActive} onUpdateRemarks={updateActionRemarks} />;
   }
-  return <MeetingList meetings={meetings} drafts={meetingDrafts} syncStatus={syncStatus} profile={profile} isAdmin={isAdmin} search={search} setSearch={setSearch} tagFilter={tagFilter} setTagFilter={setTagFilter} customColors={customColors} onSignOut={logout} onNew={() => { const key = meetingDraftKey(currentUserId, "new"); const draft = readMeetingDraft(key); setActiveDraftKey(key); setActive(draft ? { ...draft, isDraft: true } : { id: "", title: "", date: today(), attendees: "", tags: [], body: "", actions: [], visibility: "restricted", memberIds: currentUserId ? [currentUserId] : [] }); setScreen("form"); }} onView={(meeting) => { setActive(cleanMeetingActions(meeting)); setScreen("detail"); }} onEdit={(meeting) => { const key = meetingDraftKey(currentUserId, meeting.id); const draft = readMeetingDraft(key); setActiveDraftKey(key); setActive(cleanMeetingActions(draft ? { ...draft, isDraft: true } : meeting)); setScreen("form"); }} onOpenDraft={openDraft} onDeleteDraft={deleteDraft} onDelete={deleteMeeting} />;
+  return <MeetingList meetings={meetings} drafts={meetingDrafts} syncStatus={syncStatus} profile={profile} currentUserId={currentUserId} isAdmin={isAdmin} search={search} setSearch={setSearch} tagFilter={tagFilter} setTagFilter={setTagFilter} customColors={customColors} onSignOut={logout} onNew={() => { const key = meetingDraftKey(currentUserId, "new"); const draft = readMeetingDraft(key); setActiveDraftKey(key); setActive(draft ? { ...draft, isDraft: true } : { id: "", title: "", date: today(), attendees: "", tags: [], body: "", actions: [], visibility: "restricted", memberIds: currentUserId ? [currentUserId] : [] }); setScreen("form"); }} onView={(meeting) => { setActive(cleanMeetingActions(meeting)); setScreen("detail"); }} onEdit={(meeting) => { const key = meetingDraftKey(currentUserId, meeting.id); const draft = readMeetingDraft(key); setActiveDraftKey(key); setActive(cleanMeetingActions(draft ? { ...draft, isDraft: true } : meeting)); setScreen("form"); }} onOpenDraft={openDraft} onDeleteDraft={deleteDraft} onDelete={deleteMeeting} />;
 }
 
-function MeetingList({ meetings, drafts, syncStatus, profile, isAdmin, search, setSearch, tagFilter, setTagFilter, customColors, onSignOut, onNew, onView, onEdit, onOpenDraft, onDeleteDraft, onDelete }) {
+function MeetingList({ meetings, drafts, syncStatus, profile, currentUserId, isAdmin, search, setSearch, tagFilter, setTagFilter, customColors, onSignOut, onNew, onView, onEdit, onOpenDraft, onDeleteDraft, onDelete }) {
   const screen = useResponsive();
+  const [confirm, setConfirm] = useState(null);
+  const [deleting, setDeleting] = useState(false);
   const now = new Date();
   const draftMeetingIds = new Set((drafts || []).map((draft) => draft.id).filter(Boolean));
   const displayMeetings = [...(drafts || []), ...meetings.filter((meeting) => !draftMeetingIds.has(meeting.id))];
@@ -934,6 +1019,40 @@ function MeetingList({ meetings, drafts, syncStatus, profile, isAdmin, search, s
     return date.getMonth() === now.getMonth() && date.getFullYear() === now.getFullYear();
   }).length;
   const openActions = displayMeetings.reduce((sum, meeting) => sum + (meeting.actions || []).filter((action) => (action.status || "open") === "open").length, 0);
+
+  function requestDeleteMeeting(meeting) {
+    setConfirm({
+      kind: "meeting",
+      meeting,
+      title: "Delete meeting?",
+      message: `This will permanently delete "${meeting.title || "Untitled meeting"}" and its action items.`,
+      confirmText: "Delete Meeting",
+    });
+  }
+
+  function requestDeleteDraft(meeting) {
+    setConfirm({
+      kind: "draft",
+      meeting,
+      title: "Delete draft?",
+      message: `This will remove the local draft "${meeting.title || "Untitled meeting draft"}".`,
+      confirmText: "Delete Draft",
+    });
+  }
+
+  async function confirmDelete() {
+    if (!confirm) return;
+    setDeleting(true);
+    if (confirm.kind === "draft") {
+      onDeleteDraft(confirm.meeting.draftKey);
+      setDeleting(false);
+      setConfirm(null);
+      return;
+    }
+    const deleted = await onDelete(confirm.meeting.id);
+    setDeleting(false);
+    if (deleted) setConfirm(null);
+  }
 
   return (
     <div style={pageStyle}>
@@ -989,13 +1108,13 @@ function MeetingList({ meetings, drafts, syncStatus, profile, isAdmin, search, s
                 {meeting.isDraft ? (
                   <>
                     <Button tone="primary" onClick={() => onOpenDraft(meeting)} style={screen.isMobile ? { flex: "1 1 30%" } : null}>Continue Draft</Button>
-                    <Button tone="danger" onClick={() => onDeleteDraft(meeting.draftKey)} style={screen.isMobile ? { flex: "1 1 30%" } : null}>Delete Draft</Button>
+                    <Button tone="danger" onClick={() => requestDeleteDraft(meeting)} style={screen.isMobile ? { flex: "1 1 30%" } : null}>Delete Draft</Button>
                   </>
                 ) : (
                   <>
                     <Button onClick={() => onView(meeting)} style={screen.isMobile ? { flex: "1 1 30%" } : null}>View</Button>
-                    {isAdmin && <Button onClick={() => onEdit(meeting)} style={screen.isMobile ? { flex: "1 1 30%" } : null}>Edit</Button>}
-                    {isAdmin && <Button tone="danger" onClick={() => onDelete(meeting.id)} style={screen.isMobile ? { flex: "1 1 30%" } : null}>Delete</Button>}
+                    {(isAdmin || meeting.createdBy === currentUserId) && <Button onClick={() => onEdit(meeting)} style={screen.isMobile ? { flex: "1 1 30%" } : null}>Edit</Button>}
+                    {isAdmin && <Button tone="danger" onClick={() => requestDeleteMeeting(meeting)} style={screen.isMobile ? { flex: "1 1 30%" } : null}>Delete</Button>}
                   </>
                 )}
               </div>
@@ -1003,6 +1122,17 @@ function MeetingList({ meetings, drafts, syncStatus, profile, isAdmin, search, s
           );
         })}
       </div>
+      {confirm && (
+        <ConfirmModal
+          title={confirm.title}
+          message={confirm.message}
+          confirmText={confirm.confirmText}
+          tone="danger"
+          busy={deleting}
+          onCancel={() => !deleting && setConfirm(null)}
+          onConfirm={confirmDelete}
+        />
+      )}
     </div>
   );
 }
@@ -1016,6 +1146,9 @@ function MeetingForm({ data, draftKey, allTags, customTags, customColors, profil
   const [manualPeople, setManualPeople] = useState([]);
   const [hint, setHint] = useState("");
   const [busy, setBusy] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState("");
+  const [deleteActionId, setDeleteActionId] = useState("");
   const [recording, setRecording] = useState(false);
   const [interim, setInterim] = useState("");
   const [draftSavedAt, setDraftSavedAt] = useState("");
@@ -1036,6 +1169,7 @@ function MeetingForm({ data, draftKey, allTags, customTags, customColors, profil
   const actionCategories = [...new Set((form.actions || []).map((action) => action.category || "General"))];
   const memberIds = [...new Set([...(form.memberIds || []), currentUserId].filter(Boolean))];
   const selectedMembers = profiles.filter((person) => memberIds.includes(person.id));
+  const canManageAccess = isAdmin || !form.id || data.createdBy === currentUserId;
 
   useEffect(() => {
     actionsRef.current = form.actions || [];
@@ -1090,6 +1224,11 @@ function MeetingForm({ data, draftKey, allTags, customTags, customColors, profil
       actionsRef.current = nextActions;
       return { ...prev, actions: actionsRef.current };
     });
+  }
+
+  function deleteAction(id) {
+    setForm((prev) => ({ ...prev, actions: prev.actions.filter((item) => item.id !== id) }));
+    setDeleteActionId("");
   }
 
   function addManualPerson(name) {
@@ -1312,8 +1451,14 @@ function MeetingForm({ data, draftKey, allTags, customTags, customColors, profil
       return;
     }
     savingRef.current = true;
+    setSaving(true);
+    setSaveError("");
     const saved = await onSave({ ...form, actions: dedupeActions(form.actions || []) });
-    if (!saved) savingRef.current = false;
+    if (!saved) {
+      savingRef.current = false;
+      setSaving(false);
+      setSaveError("The meeting was not saved. Check the sync status message for the exact Supabase error.");
+    }
   }
 
   return (
@@ -1340,7 +1485,7 @@ function MeetingForm({ data, draftKey, allTags, customTags, customColors, profil
             <label style={labelStyle}>Attendees</label>
             <input value={form.attendees} onChange={(e) => setField("attendees", e.target.value)} placeholder="Bharath, Dileep, Teja" style={inputStyle} />
           </div>
-          {isAdmin && (
+          {canManageAccess && (
             <div style={{ marginTop: 12 }}>
               <label style={labelStyle}>Meeting Access</label>
               <div style={{ display: "flex", gap: 7, flexWrap: "wrap" }}>
@@ -1455,7 +1600,7 @@ function MeetingForm({ data, draftKey, allTags, customTags, customColors, profil
                   <div style={{ display: "flex", gap: 7, flexWrap: "wrap", alignItems: "center", marginTop: 10 }}>
                     {Object.entries(STATUS_MAP).map(([key, status]) => <button key={key} type="button" onClick={() => updateAction(action.id, { status: key })} style={{ border: "1px solid " + ((action.status || "open") === key ? status.border : "#deded8"), background: (action.status || "open") === key ? status.bg : "#fff", color: (action.status || "open") === key ? status.color : "#777", borderRadius: 999, padding: "5px 10px", fontSize: 12, fontWeight: 750, cursor: "pointer" }}>{status.label}</button>)}
                     {(action.status || "open") === "postponed" && <input type="date" value={action.postponeDate || ""} onChange={(e) => updateAction(action.id, { postponeDate: e.target.value })} style={{ ...inputStyle, width: 155, padding: "6px 9px" }} />}
-                    <Button type="button" tone="danger" style={{ marginLeft: screen.isMobile ? 0 : "auto" }} onClick={() => setForm((prev) => ({ ...prev, actions: prev.actions.filter((item) => item.id !== action.id) }))}>Delete</Button>
+                    <Button type="button" tone="danger" style={{ marginLeft: screen.isMobile ? 0 : "auto" }} onClick={() => setDeleteActionId(action.id)}>Delete</Button>
                   </div>
                   <textarea value={action.remarks || ""} onChange={(e) => updateAction(action.id, { remarks: e.target.value })} placeholder="Remarks" rows={2} style={{ ...inputStyle, marginTop: 10, resize: "vertical" }} />
                 </div>
@@ -1465,15 +1610,33 @@ function MeetingForm({ data, draftKey, allTags, customTags, customColors, profil
           ))}
           <div style={{ display: "flex", justifyContent: "flex-end", gap: 8, borderTop: "1px solid #f0f0ec", marginTop: 16, paddingTop: 14, flexDirection: screen.isMobile ? "column-reverse" : "row" }}>
             <Button onClick={backToList} style={screen.isMobile ? { width: "100%" } : null}>Cancel</Button>
-            <Button tone="primary" onClick={save} style={screen.isMobile ? { width: "100%" } : null}>Save Meeting</Button>
+            <Button tone="primary" disabled={saving} onClick={save} style={screen.isMobile ? { width: "100%" } : null}>{saving ? "Saving..." : "Save Meeting"}</Button>
           </div>
         </div>
       </div>
+      {saving && !saveError && <SavingModal />}
+      {saveError && (
+        <Modal title="Save failed" message={saveError} onClose={() => setSaveError("")}>
+          <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 18 }}>
+            <Button type="button" tone="primary" onClick={() => setSaveError("")}>OK</Button>
+          </div>
+        </Modal>
+      )}
+      {deleteActionId && (
+        <ConfirmModal
+          title="Delete action item?"
+          message="This removes the action from the meeting draft. Save the meeting to persist the change."
+          confirmText="Delete Action"
+          tone="danger"
+          onCancel={() => setDeleteActionId("")}
+          onConfirm={() => deleteAction(deleteActionId)}
+        />
+      )}
     </div>
   );
 }
 
-function MeetingDetail({ note, customColors, canEdit, onBack, onEdit, onUpdate }) {
+function MeetingDetail({ note, customColors, canEdit, canRemark, onBack, onEdit, onUpdate, onUpdateRemarks }) {
   const screen = useResponsive();
   const [editingId, setEditingId] = useState("");
   const [draft, setDraft] = useState("");
@@ -1483,7 +1646,13 @@ function MeetingDetail({ note, customColors, canEdit, onBack, onEdit, onUpdate }
   const pct = actions.length ? Math.round((completed / actions.length) * 100) : 0;
 
   function patchAction(id, patch) {
-    onUpdate({ ...note, actions: actions.map((action) => action.id === id ? { ...action, ...patch } : action) });
+    if (canEdit) {
+      onUpdate({ ...note, actions: actions.map((action) => action.id === id ? { ...action, ...patch } : action) });
+      return;
+    }
+    if (canRemark && Object.keys(patch).length === 1 && Object.prototype.hasOwnProperty.call(patch, "remarks")) {
+      onUpdateRemarks(note.id, id, patch.remarks);
+    }
   }
 
   return (
@@ -1548,7 +1717,7 @@ function MeetingDetail({ note, customColors, canEdit, onBack, onEdit, onUpdate }
                       {(action.status || "open") === "postponed" && <input type="date" disabled={!canEdit} value={action.postponeDate || ""} onChange={(e) => patchAction(action.id, { postponeDate: e.target.value })} style={{ ...inputStyle, width: 155, padding: "6px 9px" }} />}
                     </div>
                     {action.status === "postponed" && action.postponeDate && <div style={{ color: "#92400e", fontSize: 12, marginTop: 8 }}>Postponed to {fmtDate(action.postponeDate)}</div>}
-                    <textarea disabled={!canEdit} value={action.remarks || ""} onChange={(e) => patchAction(action.id, { remarks: e.target.value })} placeholder="Remarks" rows={2} style={{ ...inputStyle, marginTop: 10, resize: "vertical", background: "#f9f9f7" }} />
+                    <textarea disabled={!canEdit && !canRemark} value={action.remarks || ""} onChange={(e) => patchAction(action.id, { remarks: e.target.value })} placeholder="Remarks" rows={2} style={{ ...inputStyle, marginTop: 10, resize: "vertical", background: canEdit || canRemark ? "#fff" : "#f9f9f7" }} />
                   </div>
                 );
                 })}
